@@ -8,12 +8,22 @@ import './style.css';
 const app = document.querySelector('#app');
 const DEFAULT_USERNAME = 'alexey-kozhakin';
 const DEFAULT_DEPTH = 12;
-const GAMES_LIMIT = 10;
-const MISTAKE_THRESHOLD = 70;
-const BLUNDER_THRESHOLD = 200;
+const DEFAULT_GAMES_LIMIT = 10;
+const GAME_TIME_CLASS = 'rapid';
+const LOSS_EXCELLENT_MAX = 10;
+const LOSS_GOOD_MAX = 30;
+const LOSS_INACCURACY_MAX = 70;
+const LOSS_MISTAKE_MAX = 200;
+const BRILLIANT_MATERIAL_DROP = 2;
+const GREAT_SWING_THRESHOLD = 150;
+const MISS_WIN_THRESHOLD = 85;
+const MISS_LOSS_THRESHOLD = 150;
+const PIECE_VALUES = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 0 };
+const REVIEW_CATEGORIES = ['Brilliant', 'Great', 'Best', 'Excellent', 'Good', 'Inaccuracy', 'Mistake', 'Miss', 'Blunder'];
 
 const state = {
   username: DEFAULT_USERNAME,
+  gamesLimit: DEFAULT_GAMES_LIMIT,
   games: [],
   selected: -1,
   analysis: null,
@@ -38,15 +48,14 @@ async function fetchMonth(archiveUrl) {
   return (await response.json()).games || [];
 }
 
-async function fetchLastGames(username) {
+async function fetchLastGames(username, limit) {
   const archives = await fetchArchives(username);
-  if (!archives.length) return [];
-  let games = await fetchMonth(archives[archives.length - 1]);
-  if (games.length < GAMES_LIMIT && archives.length > 1) {
-    const previous = await fetchMonth(archives[archives.length - 2]);
-    games = [...previous, ...games];
+  const games = [];
+  for (let index = archives.length - 1; index >= 0 && games.length < limit; index--) {
+    const monthGames = await fetchMonth(archives[index]);
+    games.push(...monthGames.filter(game => game.time_class === GAME_TIME_CLASS));
   }
-  return games.sort((a, b) => b.end_time - a.end_time).slice(0, GAMES_LIMIT);
+  return games.sort((a, b) => b.end_time - a.end_time).slice(0, limit);
 }
 
 function playerColorFor(game, username) {
@@ -114,6 +123,48 @@ function scoreFor(info, color, fen) {
   return color === 'w' ? whiteScore : -whiteScore;
 }
 function sanFor(board, uci) { return uci ? board.move({ from: uci.slice(0, 2), to: uci.slice(2, 4), promotion: uci[4] || 'q' })?.san : '—'; }
+function materialBalance(fen, color) {
+  let balance = 0;
+  new Chess(fen).board().forEach(row => row.forEach(square => {
+    if (!square) return;
+    balance += square.color === color ? PIECE_VALUES[square.type] : -PIECE_VALUES[square.type];
+  }));
+  return balance;
+}
+function winPercent(cp) {
+  const capped = Math.max(-1000, Math.min(1000, cp));
+  return 50 + 50 * (2 / (1 + Math.exp(-0.00368208 * capped)) - 1);
+}
+function moveAccuracyFromWinDiff(winDiff) {
+  return Math.max(0, Math.min(100, 103.1668 * Math.exp(-0.04354 * winDiff) - 3.1669));
+}
+function harmonicMean(values) {
+  if (!values.length) return 0;
+  return values.length / values.reduce((sum, value) => sum + 1 / Math.max(value, 0.01), 0);
+}
+function classifyMove({ loss, winBefore, materialDrop, swing }) {
+  let category;
+  if (loss <= 0) category = 'Best';
+  else if (loss <= LOSS_EXCELLENT_MAX) category = 'Excellent';
+  else if (loss <= LOSS_GOOD_MAX) category = 'Good';
+  else if (loss <= LOSS_INACCURACY_MAX) category = 'Inaccuracy';
+  else if (loss <= LOSS_MISTAKE_MAX) category = 'Mistake';
+  else category = 'Blunder';
+  if (loss <= LOSS_EXCELLENT_MAX && materialDrop >= BRILLIANT_MATERIAL_DROP) category = 'Brilliant';
+  else if (loss <= 0 && swing >= GREAT_SWING_THRESHOLD) category = 'Great';
+  if (winBefore >= MISS_WIN_THRESHOLD && loss >= MISS_LOSS_THRESHOLD) category = 'Miss';
+  return category;
+}
+function buildSideReview(moveReviews, color) {
+  const moves = moveReviews.filter(item => item.color === color);
+  const counts = Object.fromEntries(REVIEW_CATEGORIES.map(category => [category, 0]));
+  moves.forEach(move => { counts[move.category]++; });
+  const acpl = moves.length ? Math.round(moves.reduce((sum, move) => sum + move.loss, 0) / moves.length) : 0;
+  const accuracies = moves.map(move => move.moveAccuracy);
+  const accuracy = accuracies.length ? (accuracies.reduce((sum, value) => sum + value, 0) / accuracies.length + harmonicMean(accuracies)) / 2 : 100;
+  const estimatedElo = Math.round(Math.max(400, Math.min(2900, 2882 - 320 * Math.log(1 + acpl / 10))));
+  return { counts, acpl, accuracy, estimatedElo };
+}
 function formatScore(value) { return `${value >= 0 ? '+' : ''}${(value / 100).toFixed(2)}`; }
 function advantageText(whiteScore) {
   if (Math.abs(whiteScore) < 30) return 'примерно равно';
@@ -159,31 +210,37 @@ async function analyseGame(game) {
     const board = new Chess();
     const errors = [];
     const evaluations = [{ ply: 0, score: 0, label: 'Начальная позиция' }];
+    const moveReviews = [];
+    // Reused as next ply's "before" analysis — it's the same position, so no need to re-run Stockfish on it.
+    let prevInfo = await engine.analyse(board.fen());
     for (let index = 0; index < history.length; index++) {
       const move = history[index];
       if (progress) progress.textContent = `Stockfish: ${index + 1}/${history.length} полуходов`;
-      if (board.turn() === color) {
-        const fen = board.fen();
-        const beforeInfo = await engine.analyse(fen);
-        const before = scoreFor(beforeInfo, color, fen);
-        const bestUci = beforeInfo.pv[0];
-        const playedUci = `${move.from}${move.to}${move.promotion || ''}`;
-        board.move(move);
-        const afterInfo = await engine.analyse(board.fen());
-        const afterFen = board.fen();
-        const after = scoreFor(afterInfo, color, afterFen);
-        evaluations.push({ ply: index + 1, score: scoreFor(afterInfo, 'w', afterFen), label: `${Math.floor(index / 2) + 1}${index % 2 === 0 ? '.' : '…'} ${move.san}` });
-        const loss = Math.max(0, before - after);
-        if (loss >= MISTAKE_THRESHOLD) {
-          const beforeBoard = new Chess(fen);
-          const replyUci = afterInfo.pv[0];
-          const replyBoard = new Chess(afterFen);
-          errors.push({ fen, afterFen, color, played: move.san, playedUci, best: sanFor(beforeBoard, bestUci), bestUci, reply: sanFor(replyBoard, replyUci), replyUci, before, after, loss, moveNumber: Math.floor(index / 2) + 1, label: loss >= BLUNDER_THRESHOLD ? 'Blunder' : 'Mistake' });
-        }
-      } else {
-        board.move(move);
-        const afterInfo = await engine.analyse(board.fen());
-        evaluations.push({ ply: index + 1, score: scoreFor(afterInfo, 'w', board.fen()), label: `${Math.floor(index / 2) + 1}… ${move.san}` });
+      const mover = board.turn();
+      const fen = board.fen();
+      const beforeInfo = prevInfo;
+      const before = scoreFor(beforeInfo, mover, fen);
+      const bestUci = beforeInfo.pv[0];
+      const playedUci = `${move.from}${move.to}${move.promotion || ''}`;
+      const materialBefore = materialBalance(fen, mover);
+      board.move(move);
+      const afterFen = board.fen();
+      const afterInfo = await engine.analyse(afterFen);
+      const after = scoreFor(afterInfo, mover, afterFen);
+      const materialAfter = materialBalance(afterFen, mover);
+      prevInfo = afterInfo;
+      evaluations.push({ ply: index + 1, score: scoreFor(afterInfo, 'w', afterFen), label: `${Math.floor(index / 2) + 1}${index % 2 === 0 ? '.' : '…'} ${move.san}` });
+      const loss = Math.max(0, before - after);
+      const winBefore = winPercent(before);
+      const moveAccuracy = moveAccuracyFromWinDiff(Math.max(0, winBefore - winPercent(after)));
+      const swing = evaluations.length >= 2 ? Math.abs(evaluations[evaluations.length - 1].score - evaluations[evaluations.length - 2].score) : 0;
+      const category = classifyMove({ loss, winBefore, materialDrop: materialBefore - materialAfter, swing });
+      moveReviews.push({ ply: index + 1, moveNumber: Math.floor(index / 2) + 1, color: mover, category, loss, moveAccuracy });
+      if (mover === color && ['Mistake', 'Blunder', 'Miss'].includes(category)) {
+        const beforeBoard = new Chess(fen);
+        const replyUci = afterInfo.pv[0];
+        const replyBoard = new Chess(afterFen);
+        errors.push({ fen, afterFen, color, played: move.san, playedUci, best: sanFor(beforeBoard, bestUci), bestUci, reply: sanFor(replyBoard, replyUci), replyUci, before, after, loss, moveNumber: Math.floor(index / 2) + 1, label: category });
       }
     }
     // Standard PGNs have no FEN header. Passing null to chess.js breaks its parser;
@@ -191,7 +248,8 @@ async function analyseGame(game) {
     const replayChess = new Chess(chess.header().FEN || undefined);
     const positions = [replayChess.fen()];
     history.forEach(move => { replayChess.move(move); positions.push(replayChess.fen()); });
-    state.analysis = { game, color, errors: errors.sort((a, b) => a.moveNumber - b.moveNumber), evaluations, positions, moves: history };
+    const review = { w: buildSideReview(moveReviews, 'w'), b: buildSideReview(moveReviews, 'b') };
+    state.analysis = { game, color, errors: errors.sort((a, b) => a.moveNumber - b.moveNumber), evaluations, positions, moves: history, review };
     state.replayIndex = 0;
     state.replayFlipped = false;
     if (progress) progress.textContent = `Анализ завершён: критических позиций — ${errors.length}.`;
@@ -225,6 +283,28 @@ function renderSummary() {
   </div>`;
 }
 
+function renderGameReview() {
+  const target = document.querySelector('#game-review');
+  const { review, game } = state.analysis;
+  if (!target || !review) return;
+  const rows = REVIEW_CATEGORIES.map(category => `<tr>
+    <td>${review.w.counts[category]}</td>
+    <td class="review-icon"><span class="tag ${category.toLowerCase()}">${category}</span></td>
+    <td>${review.b.counts[category]}</td>
+  </tr>`).join('');
+  target.innerHTML = `<div class="card review-card">
+    <div class="eyebrow">Game Review</div>
+    <h2>Разбор партии по категориям ходов</h2>
+    <div class="summary-grid">
+      <div><span>Точность — ${game.white.username}</span><b>${review.w.accuracy.toFixed(1)}</b></div>
+      <div><span>Точность — ${game.black.username}</span><b>${review.b.accuracy.toFixed(1)}</b></div>
+      <div><span>Рейтинг партии — ${game.white.username}</span><b>${review.w.estimatedElo}</b></div>
+      <div><span>Рейтинг партии — ${game.black.username}</span><b>${review.b.estimatedElo}</b></div>
+    </div>
+    <table class="error-table review-table"><thead><tr><th>${game.white.username}</th><th>Категория</th><th>${game.black.username}</th></tr></thead><tbody>${rows}</tbody></table>
+  </div>`;
+}
+
 function renderEvaluationChart() {
   const { evaluations, errors } = state.analysis;
   const target = document.querySelector('#evaluation-chart');
@@ -248,7 +328,7 @@ function renderEvaluationChart() {
     const status = error ? ` · ${error.label}: потеря ${formatScore(error.loss)}` : '';
     return `<circle cx="${point.x.toFixed(1)}" cy="${point.y.toFixed(1)}" r="${error ? 7 : 4}" class="chart-point ${error ? `chart-${error.label.toLowerCase()}` : ''}" ${error ? `data-chart-ply="${index}" role="button" tabindex="0"` : ''}><title>${evaluations[index].label}: ${formatScore(evaluations[index].score)} для белых${status}</title></circle>`;
   }).join('');
-  target.innerHTML = `<div class="chart-card"><div class="chart-heading"><div><div class="eyebrow">Оценка Stockfish после каждого хода</div><h2>Преимущество в партии</h2></div><span class="score-label">Белые ↑ · Чёрные ↓</span></div><svg class="evaluation-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="График преимущества белых и чёрных"><line x1="0" y1="${center}" x2="${width}" y2="${center}" class="chart-zero"/><line x1="0" y1="40" x2="${width}" y2="40" class="chart-grid"/><line x1="0" y1="190" x2="${width}" y2="190" class="chart-grid"/><polygon points="${area}" class="chart-area"/><polyline points="${line}" class="chart-line"/>${pointMarkup}</svg><div class="chart-caption"><span>Начальная позиция</span><span><i class="chart-key blunder"></i> Blunder <i class="chart-key mistake"></i> Mistake · нажмите на метку, чтобы открыть позицию</span><span>Конец партии</span></div></div>`;
+  target.innerHTML = `<div class="chart-card"><div class="chart-heading"><div><div class="eyebrow">Оценка Stockfish после каждого хода</div><h2>Преимущество в партии</h2></div><span class="score-label">Белые ↑ · Чёрные ↓</span></div><svg class="evaluation-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="График преимущества белых и чёрных"><line x1="0" y1="${center}" x2="${width}" y2="${center}" class="chart-zero"/><line x1="0" y1="40" x2="${width}" y2="40" class="chart-grid"/><line x1="0" y1="190" x2="${width}" y2="190" class="chart-grid"/><polygon points="${area}" class="chart-area"/><polyline points="${line}" class="chart-line"/>${pointMarkup}</svg><div class="chart-caption"><span>Начальная позиция</span><span><i class="chart-key blunder"></i> Blunder <i class="chart-key mistake"></i> Mistake <i class="chart-key miss"></i> Miss · нажмите на метку, чтобы открыть позицию</span><span>Конец партии</span></div></div>`;
   const openPly = element => {
     state.replayIndex = Number(element.dataset.chartPly);
     renderReplay();
@@ -360,8 +440,9 @@ function navigateReplay(delta) {
 }
 
 function renderReport() {
-  document.querySelector('#report').innerHTML = `<div id="summary"></div><div id="evaluation-chart"></div><div id="game-replay"></div><div id="error-table"></div>`;
+  document.querySelector('#report').innerHTML = `<div id="summary"></div><div id="game-review"></div><div id="evaluation-chart"></div><div id="game-replay"></div><div id="error-table"></div>`;
   renderSummary();
+  renderGameReview();
   renderEvaluationChart();
   renderReplay();
   renderErrorTable();
@@ -385,16 +466,17 @@ function selectGame(index) {
   analyseGame(state.games[index]);
 }
 
-async function loadGames(username) {
+async function loadGames(username, limit) {
   const progress = document.querySelector('#progress');
   progress.textContent = 'Загрузка партий…';
   state.username = username;
+  state.gamesLimit = limit;
   state.selected = -1;
   state.analysis = null;
   document.querySelector('#report').innerHTML = '<div class="empty">Выберите партию слева.</div>';
   try {
-    state.games = await fetchLastGames(username);
-    progress.textContent = `Загружено партий: ${state.games.length}.`;
+    state.games = await fetchLastGames(username, limit);
+    progress.textContent = `Загружено rapid-партий: ${state.games.length}.`;
     renderGames();
   } catch (error) {
     console.error(error);
@@ -405,12 +487,13 @@ async function loadGames(username) {
 }
 
 function render() {
-  app.innerHTML = `<header><h1>Game Analyzer Lite</h1><p>Последние 10 партий Chess.com с разбором Stockfish прямо в браузере.</p></header><main><aside><form id="username-form"><label>Chess.com username<input id="username" value="${DEFAULT_USERNAME}" required></label><button>Загрузить партии</button></form><div id="progress"></div><div id="games"></div></aside><section><div id="report"><div class="empty">Выберите партию слева.</div></div></section></main>`;
+  const limitOptions = [10, 20, 50, 100].map(value => `<option value="${value}" ${value === DEFAULT_GAMES_LIMIT ? 'selected' : ''}>${value}</option>`).join('');
+  app.innerHTML = `<header><h1>Game Analyzer Lite</h1><p>Последние rapid-партии Chess.com с разбором Stockfish прямо в браузере.</p></header><main><aside><form id="username-form"><label>Chess.com username<input id="username" value="${DEFAULT_USERNAME}" required></label><label>Количество партий<select id="games-limit">${limitOptions}</select></label><button>Загрузить партии</button></form><div id="progress"></div><div id="games"></div></aside><section><div id="report"><div class="empty">Выберите партию слева.</div></div></section></main>`;
   document.querySelector('#username-form').onsubmit = event => {
     event.preventDefault();
-    loadGames(document.querySelector('#username').value.trim());
+    loadGames(document.querySelector('#username').value.trim(), Number(document.querySelector('#games-limit').value));
   };
-  loadGames(DEFAULT_USERNAME);
+  loadGames(DEFAULT_USERNAME, DEFAULT_GAMES_LIMIT);
 }
 
 document.addEventListener('keydown', event => {
