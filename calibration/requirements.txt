@@ -1,0 +1,4 @@
+requests
+chess
+numpy
+torch

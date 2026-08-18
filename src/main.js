@@ -18,6 +18,8 @@ const BRILLIANT_MATERIAL_DROP = 2;
 const GREAT_SWING_THRESHOLD = 150;
 const MISS_WIN_THRESHOLD = 85;
 const MISS_LOSS_THRESHOLD = 150;
+const TRAINER_EQUAL_THRESHOLD = 100;
+const TRAINER_LIMIT_OPTIONS = [10, 20, 50];
 const PIECE_VALUES = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 0 };
 const REVIEW_CATEGORIES = ['Brilliant', 'Great', 'Best', 'Excellent', 'Good', 'Inaccuracy', 'Mistake', 'Miss', 'Blunder'];
 
@@ -32,8 +34,20 @@ const state = {
   replayBoard: null,
   replayChess: null,
   replayFlipped: false,
-  replayHints: false,
+  replayHintsColor: 'off',
   replayVersion: 0,
+  view: 'game',
+  trainer: {
+    limit: 20,
+    positions: [],
+    index: 0,
+    scanning: false,
+  },
+  trainerBoard: null,
+  trainerChess: null,
+  trainerVersion: 0,
+  trainerShowBest: false,
+  trainerShowPlayed: false,
 };
 
 async function fetchArchives(username) {
@@ -162,7 +176,7 @@ function buildSideReview(moveReviews, color) {
   const acpl = moves.length ? Math.round(moves.reduce((sum, move) => sum + move.loss, 0) / moves.length) : 0;
   const accuracies = moves.map(move => move.moveAccuracy);
   const accuracy = accuracies.length ? (accuracies.reduce((sum, value) => sum + value, 0) / accuracies.length + harmonicMean(accuracies)) / 2 : 100;
-  const estimatedElo = Math.round(Math.max(400, Math.min(2900, 2882 - 320 * Math.log(1 + acpl / 10))));
+  const estimatedElo = Math.round(Math.max(400, Math.min(2900, 903.7 - 3.37 * Math.log(1 + acpl / 56.32))));
   return { counts, acpl, accuracy, estimatedElo };
 }
 function formatScore(value) { return `${value >= 0 ? '+' : ''}${(value / 100).toFixed(2)}`; }
@@ -171,13 +185,13 @@ function advantageText(whiteScore) {
   return `преимущество ${whiteScore > 0 ? 'белых' : 'чёрных'}`;
 }
 function replayColorName(color) { return color === 'w' ? 'white' : 'black'; }
-function evaluationBarHtml(score) {
+function evaluationBarHtml(score, idPrefix = 'replay') {
   const whitePercent = Math.max(3, Math.min(97, 50 + score / 20));
-  return `<div id="replay-eval-bar" class="eval-bar" title="${formatScore(score)} для белых"><div class="eval-bar-black"></div><div class="eval-bar-white" style="height:${whitePercent}%"><b>${formatScore(score)}</b></div></div>`;
+  return `<div id="${idPrefix}-eval-bar" class="eval-bar" title="${formatScore(score)} для белых"><div class="eval-bar-black"></div><div class="eval-bar-white" style="height:${whitePercent}%"><b>${formatScore(score)}</b></div></div>`;
 }
-function updateReplayEvaluation(score, label = 'Оценка позиции') {
-  const evaluation = document.querySelector('#replay-eval');
-  const bar = document.querySelector('#replay-eval-bar');
+function updateEvaluationPanel(idPrefix, score, label = 'Оценка позиции') {
+  const evaluation = document.querySelector(`#${idPrefix}-eval`);
+  const bar = document.querySelector(`#${idPrefix}-eval-bar`);
   if (evaluation) evaluation.innerHTML = `<span>${label}</span><b>${formatScore(score)}</b><span>${advantageText(score)}</span>`;
   if (bar) {
     bar.title = `${formatScore(score)} для белых`;
@@ -196,63 +210,70 @@ function legalDestsFor(chess) {
   return destinations;
 }
 
+async function computeGameAnalysis(game, onProgress) {
+  const chess = new Chess();
+  chess.loadPgn(game.pgn);
+  const history = chess.history({ verbose: true });
+  if (!history.length) throw new Error('В PGN не найдены ходы.');
+  const color = playerColorFor(game, state.username);
+  if (!color) throw new Error('Не удалось определить цвет игрока в этой партии.');
+  const board = new Chess();
+  const errors = [];
+  const evaluations = [{ ply: 0, score: 0, label: 'Начальная позиция' }];
+  const moveReviews = [];
+  // Reused as next ply's "before" analysis — it's the same position, so no need to re-run Stockfish on it.
+  let prevInfo = await engine.analyse(board.fen());
+  for (let index = 0; index < history.length; index++) {
+    const move = history[index];
+    if (onProgress) onProgress(index + 1, history.length);
+    const mover = board.turn();
+    const fen = board.fen();
+    const beforeInfo = prevInfo;
+    const before = scoreFor(beforeInfo, mover, fen);
+    const bestUci = beforeInfo.pv[0];
+    const playedUci = `${move.from}${move.to}${move.promotion || ''}`;
+    const materialBefore = materialBalance(fen, mover);
+    board.move(move);
+    const afterFen = board.fen();
+    const afterInfo = await engine.analyse(afterFen);
+    const after = scoreFor(afterInfo, mover, afterFen);
+    const materialAfter = materialBalance(afterFen, mover);
+    prevInfo = afterInfo;
+    evaluations.push({ ply: index + 1, score: scoreFor(afterInfo, 'w', afterFen), label: `${Math.floor(index / 2) + 1}${index % 2 === 0 ? '.' : '…'} ${move.san}` });
+    const loss = Math.max(0, before - after);
+    const winBefore = winPercent(before);
+    const moveAccuracy = moveAccuracyFromWinDiff(Math.max(0, winBefore - winPercent(after)));
+    const swing = evaluations.length >= 2 ? Math.abs(evaluations[evaluations.length - 1].score - evaluations[evaluations.length - 2].score) : 0;
+    const category = classifyMove({ loss, winBefore, materialDrop: materialBefore - materialAfter, swing });
+    moveReviews.push({ ply: index + 1, moveNumber: Math.floor(index / 2) + 1, color: mover, category, loss, moveAccuracy });
+    if (mover === color && ['Mistake', 'Blunder', 'Miss'].includes(category)) {
+      const beforeBoard = new Chess(fen);
+      const replyUci = afterInfo.pv[0];
+      const replyBoard = new Chess(afterFen);
+      errors.push({ fen, afterFen, color, played: move.san, playedUci, best: sanFor(beforeBoard, bestUci), bestUci, reply: sanFor(replyBoard, replyUci), replyUci, before, after, loss, moveNumber: Math.floor(index / 2) + 1, label: category });
+    }
+  }
+  // Standard PGNs have no FEN header. Passing null to chess.js breaks its parser;
+  // undefined deliberately selects the ordinary starting position.
+  const replayChess = new Chess(chess.header().FEN || undefined);
+  const positions = [replayChess.fen()];
+  history.forEach(move => { replayChess.move(move); positions.push(replayChess.fen()); });
+  const review = { w: buildSideReview(moveReviews, 'w'), b: buildSideReview(moveReviews, 'b') };
+  return { game, color, errors: errors.sort((a, b) => a.moveNumber - b.moveNumber), evaluations, positions, moves: history, review };
+}
+
 async function analyseGame(game) {
   state.analysing = true;
   state.analysis = null;
   const progress = document.querySelector('#progress');
   try {
-    const chess = new Chess();
-    chess.loadPgn(game.pgn);
-    const history = chess.history({ verbose: true });
-    if (!history.length) throw new Error('В PGN не найдены ходы.');
-    const color = playerColorFor(game, state.username);
-    if (!color) throw new Error('Не удалось определить цвет игрока в этой партии.');
-    const board = new Chess();
-    const errors = [];
-    const evaluations = [{ ply: 0, score: 0, label: 'Начальная позиция' }];
-    const moveReviews = [];
-    // Reused as next ply's "before" analysis — it's the same position, so no need to re-run Stockfish on it.
-    let prevInfo = await engine.analyse(board.fen());
-    for (let index = 0; index < history.length; index++) {
-      const move = history[index];
-      if (progress) progress.textContent = `Stockfish: ${index + 1}/${history.length} полуходов`;
-      const mover = board.turn();
-      const fen = board.fen();
-      const beforeInfo = prevInfo;
-      const before = scoreFor(beforeInfo, mover, fen);
-      const bestUci = beforeInfo.pv[0];
-      const playedUci = `${move.from}${move.to}${move.promotion || ''}`;
-      const materialBefore = materialBalance(fen, mover);
-      board.move(move);
-      const afterFen = board.fen();
-      const afterInfo = await engine.analyse(afterFen);
-      const after = scoreFor(afterInfo, mover, afterFen);
-      const materialAfter = materialBalance(afterFen, mover);
-      prevInfo = afterInfo;
-      evaluations.push({ ply: index + 1, score: scoreFor(afterInfo, 'w', afterFen), label: `${Math.floor(index / 2) + 1}${index % 2 === 0 ? '.' : '…'} ${move.san}` });
-      const loss = Math.max(0, before - after);
-      const winBefore = winPercent(before);
-      const moveAccuracy = moveAccuracyFromWinDiff(Math.max(0, winBefore - winPercent(after)));
-      const swing = evaluations.length >= 2 ? Math.abs(evaluations[evaluations.length - 1].score - evaluations[evaluations.length - 2].score) : 0;
-      const category = classifyMove({ loss, winBefore, materialDrop: materialBefore - materialAfter, swing });
-      moveReviews.push({ ply: index + 1, moveNumber: Math.floor(index / 2) + 1, color: mover, category, loss, moveAccuracy });
-      if (mover === color && ['Mistake', 'Blunder', 'Miss'].includes(category)) {
-        const beforeBoard = new Chess(fen);
-        const replyUci = afterInfo.pv[0];
-        const replyBoard = new Chess(afterFen);
-        errors.push({ fen, afterFen, color, played: move.san, playedUci, best: sanFor(beforeBoard, bestUci), bestUci, reply: sanFor(replyBoard, replyUci), replyUci, before, after, loss, moveNumber: Math.floor(index / 2) + 1, label: category });
-      }
-    }
-    // Standard PGNs have no FEN header. Passing null to chess.js breaks its parser;
-    // undefined deliberately selects the ordinary starting position.
-    const replayChess = new Chess(chess.header().FEN || undefined);
-    const positions = [replayChess.fen()];
-    history.forEach(move => { replayChess.move(move); positions.push(replayChess.fen()); });
-    const review = { w: buildSideReview(moveReviews, 'w'), b: buildSideReview(moveReviews, 'b') };
-    state.analysis = { game, color, errors: errors.sort((a, b) => a.moveNumber - b.moveNumber), evaluations, positions, moves: history, review };
+    const analysis = await computeGameAnalysis(game, (done, total) => {
+      if (progress) progress.textContent = `Stockfish: ${done}/${total} полуходов`;
+    });
+    state.analysis = analysis;
     state.replayIndex = 0;
     state.replayFlipped = false;
-    if (progress) progress.textContent = `Анализ завершён: критических позиций — ${errors.length}.`;
+    if (progress) progress.textContent = `Анализ завершён: критических позиций — ${analysis.errors.length}.`;
     renderReport();
   } catch (error) {
     console.error(error);
@@ -387,7 +408,7 @@ function renderReplay() {
     const errorClass = error ? error.label.toLowerCase() : '';
     return `<button class="move ${errorClass} ${ply === index ? 'active' : ''}" data-replay-index="${ply}"><span>${Math.floor(moveIndex / 2) + 1}${moveIndex % 2 === 0 ? '.' : '…'}</span>${item.san}${error ? `<i>${error.label}</i>` : ''}</button>`;
   }).join('');
-  target.innerHTML = `<div class="replay-card"><div class="chart-heading"><div><div class="eyebrow">Просмотр партии</div><h2>${index === 0 ? 'Начальная позиция' : `${Math.ceil(index / 2)}${index % 2 ? '.' : '…'} ${move.san}`}</h2></div><label class="hint-toggle"><input id="replay-hints" type="checkbox" ${state.replayHints ? 'checked' : ''}> Подсказки Stockfish</label></div><div class="replay-grid"><div><div id="replay-eval" class="eval-status"><span>Оценка позиции</span><b>${formatScore(evaluation?.score || 0)}</b><span>${advantageText(evaluation?.score || 0)}</span></div><div class="replay-analysis-board">${evaluationBarHtml(evaluation?.score || 0)}<div id="replay-board" class="replay-board"></div></div><div class="replay-controls"><button id="replay-prev" class="secondary" ${index === 0 ? 'disabled' : ''}>← Назад</button><span>${index} / ${lastIndex}</span><button id="replay-next" class="secondary" ${index === lastIndex ? 'disabled' : ''}>Вперёд →</button><button id="replay-flip" class="secondary">↻</button><button id="replay-reset" class="secondary" disabled>↶ К партии</button></div><p class="hint">Ходите за обе стороны и стройте вариант столько ходов, сколько нужно. Stockfish пересчитывает позицию после каждого хода. Клавиатура: <b>←</b> и <b>→</b>.</p></div><div class="move-list">${moveButtons}</div></div></div>`;
+  target.innerHTML = `<div class="replay-card"><div class="chart-heading"><div><div class="eyebrow">Просмотр партии</div><h2>${index === 0 ? 'Начальная позиция' : `${Math.ceil(index / 2)}${index % 2 ? '.' : '…'} ${move.san}`}</h2></div><label class="hint-toggle">Подсказки Stockfish <select id="replay-hints"><option value="off" ${state.replayHintsColor === 'off' ? 'selected' : ''}>Выключены</option><option value="w" ${state.replayHintsColor === 'w' ? 'selected' : ''}>Только белые</option><option value="b" ${state.replayHintsColor === 'b' ? 'selected' : ''}>Только чёрные</option></select></label></div><div class="replay-grid"><div><div id="replay-eval" class="eval-status"><span>Оценка позиции</span><b>${formatScore(evaluation?.score || 0)}</b><span>${advantageText(evaluation?.score || 0)}</span></div><div class="replay-analysis-board">${evaluationBarHtml(evaluation?.score || 0)}<div id="replay-board" class="replay-board"></div></div><div class="replay-controls"><button id="replay-prev" class="secondary" ${index === 0 ? 'disabled' : ''}>← Назад</button><span>${index} / ${lastIndex}</span><button id="replay-next" class="secondary" ${index === lastIndex ? 'disabled' : ''}>Вперёд →</button><button id="replay-flip" class="secondary">↻</button><button id="replay-reset" class="secondary" disabled>↶ К партии</button></div><p class="hint">Ходите за обе стороны и стройте вариант столько ходов, сколько нужно. Stockfish пересчитывает позицию после каждого хода. Клавиатура: <b>←</b> и <b>→</b>.</p></div><div class="move-list">${moveButtons}</div></div></div>`;
   state.replayBoard = Chessground(document.querySelector('#replay-board'), {
     fen: analysis.positions[index], orientation, turnColor: replayColor === 'w' ? 'white' : 'black', coordinates: true,
     events: { move: tryReplayMove },
@@ -398,14 +419,14 @@ function renderReplay() {
   document.querySelector('#replay-flip').onclick = () => { state.replayFlipped = !state.replayFlipped; renderReplay(); };
   document.querySelector('#replay-reset').onclick = renderReplay;
   document.querySelector('#replay-hints').onchange = event => {
-    state.replayHints = event.target.checked;
-    if (state.replayHints) showReplayHint(replayVersion);
+    state.replayHintsColor = event.target.value;
+    if (state.replayHintsColor === replayColor) showReplayHint(replayVersion);
     else state.replayBoard.set({ drawable: { autoShapes: [] } });
   };
   document.querySelectorAll('[data-replay-index]').forEach(button => button.onclick = () => {
     state.replayIndex = Number(button.dataset.replayIndex); renderReplay();
   });
-  if (state.replayHints) showReplayHint(replayVersion);
+  if (state.replayHintsColor === replayColor) showReplayHint(replayVersion);
 }
 
 async function tryReplayMove(orig, dest) {
@@ -417,15 +438,15 @@ async function tryReplayMove(orig, dest) {
   const info = await engine.analyse(state.replayChess.fen());
   if (version !== state.replayVersion) return;
   const score = scoreFor(info, 'w', state.replayChess.fen());
-  updateReplayEvaluation(score, `После варианта ${move.san}`);
-  if (state.replayHints) showReplayHint(version, info);
+  updateEvaluationPanel('replay', score, `После варианта ${move.san}`);
+  if (state.replayHintsColor === color) showReplayHint(version, info);
   document.querySelector('#replay-reset').disabled = false;
 }
 
 async function showReplayHint(version = state.replayVersion, readyInfo = null) {
   const chess = state.replayChess;
   const info = readyInfo || await engine.analyse(chess.fen());
-  if (!state.replayHints || version !== state.replayVersion || chess !== state.replayChess) return;
+  if (state.replayHintsColor !== chess.turn() || version !== state.replayVersion || chess !== state.replayChess) return;
   const best = info.pv?.[0];
   if (!best) return;
   state.replayBoard.set({ drawable: { autoShapes: [{ orig: best.slice(0, 2), dest: best.slice(2, 4), brush: 'green' }] } });
@@ -448,6 +469,127 @@ function renderReport() {
   renderErrorTable();
 }
 
+function trainerShapes(position) {
+  const shapes = [];
+  if (state.trainerShowBest && position.bestUci) {
+    shapes.push({ orig: position.bestUci.slice(0, 2), dest: position.bestUci.slice(2, 4), brush: 'green' });
+  }
+  if (state.trainerShowPlayed && position.playedUci) {
+    shapes.push({ orig: position.playedUci.slice(0, 2), dest: position.playedUci.slice(2, 4), brush: 'red' });
+  }
+  return shapes;
+}
+
+async function scanBlunderTrainer(limit) {
+  if (state.trainer.scanning) return;
+  state.trainer.scanning = true;
+  state.trainer.limit = limit;
+  state.trainer.positions = [];
+  state.trainer.index = 0;
+  state.trainerShowBest = false;
+  state.trainerShowPlayed = false;
+  renderTrainer();
+  const found = [];
+  for (let gameIndex = 0; gameIndex < state.games.length && found.length < limit; gameIndex++) {
+    const game = state.games[gameIndex];
+    const progressEl = document.querySelector('#trainer-progress');
+    if (progressEl) progressEl.textContent = `Партия ${gameIndex + 1}/${state.games.length}, найдено позиций: ${found.length}/${limit}…`;
+    try {
+      const analysis = await computeGameAnalysis(game);
+      analysis.errors
+        .filter(error => error.label === 'Blunder' && Math.abs(error.before) <= TRAINER_EQUAL_THRESHOLD)
+        .forEach(error => { if (found.length < limit) found.push({ ...error, game }); });
+    } catch (error) {
+      console.error(error);
+    }
+  }
+  state.trainer.positions = found;
+  state.trainer.index = 0;
+  state.trainer.scanning = false;
+  renderTrainer();
+}
+
+function currentTrainerPosition() {
+  return state.trainer.positions[state.trainer.index] || null;
+}
+
+function renderTrainerCard() {
+  const target = document.querySelector('#trainer-card');
+  if (!target) return;
+  const position = currentTrainerPosition();
+  if (!position) {
+    target.innerHTML = state.trainer.scanning
+      ? '<div class="empty">Ищу блендерные позиции…</div>'
+      : '<div class="empty">Нажмите «Найти позиции», чтобы собрать зевки из загруженных партий.</div>';
+    return;
+  }
+  state.trainerChess = new Chess(position.fen);
+  const version = ++state.trainerVersion;
+  const mover = state.trainerChess.turn();
+  const orientation = position.color === 'w' ? 'white' : 'black';
+  const whiteScore = position.color === 'w' ? position.before : -position.before;
+  target.innerHTML = `<div class="replay-card"><div class="chart-heading"><div><div class="eyebrow">Зевок ${state.trainer.index + 1} из ${state.trainer.positions.length}</div><h2>${position.moveNumber}${position.color === 'w' ? '.' : '…'} — найдите лучшее продолжение за ${position.color === 'w' ? 'белых' : 'чёрных'}</h2></div><span class="score-label">${position.game.white.username} — ${position.game.black.username}</span></div><div class="replay-grid"><div><div id="trainer-eval" class="eval-status"><span>Оценка позиции</span><b>${formatScore(whiteScore)}</b><span>${advantageText(whiteScore)}</span></div><div class="replay-analysis-board">${evaluationBarHtml(whiteScore, 'trainer')}<div id="trainer-board" class="replay-board"></div></div><div class="replay-controls"><button id="trainer-prev" class="secondary" ${state.trainer.index === 0 ? 'disabled' : ''}>← Предыдущий</button><span>${state.trainer.index + 1} / ${state.trainer.positions.length}</span><button id="trainer-next" class="secondary" ${state.trainer.index === state.trainer.positions.length - 1 ? 'disabled' : ''}>Следующий →</button><button id="trainer-reset" class="secondary">↶ Сброс</button></div><label class="hint-toggle"><input id="trainer-show-best" type="checkbox" ${state.trainerShowBest ? 'checked' : ''}> Показать лучший ход</label><label class="hint-toggle"><input id="trainer-show-played" type="checkbox" ${state.trainerShowPlayed ? 'checked' : ''}> Показать сыгранный ход (${position.played}, потеря ${formatScore(position.loss)})</label></div></div></div>`;
+  state.trainerBoard = Chessground(document.querySelector('#trainer-board'), {
+    fen: position.fen, orientation, turnColor: mover === 'w' ? 'white' : 'black', coordinates: true,
+    events: { move: tryTrainerMove },
+    movable: { free: false, color: mover === 'w' ? 'white' : 'black', dests: legalDestsFor(state.trainerChess) },
+    drawable: { autoShapes: trainerShapes(position) },
+  });
+  document.querySelector('#trainer-prev').onclick = () => { if (state.trainer.index > 0) { state.trainer.index--; renderTrainerCard(); } };
+  document.querySelector('#trainer-next').onclick = () => { if (state.trainer.index < state.trainer.positions.length - 1) { state.trainer.index++; renderTrainerCard(); } };
+  document.querySelector('#trainer-reset').onclick = () => renderTrainerCard();
+  document.querySelector('#trainer-show-best').onchange = event => {
+    state.trainerShowBest = event.target.checked;
+    state.trainerBoard.set({ drawable: { autoShapes: trainerShapes(position) } });
+  };
+  document.querySelector('#trainer-show-played').onchange = event => {
+    state.trainerShowPlayed = event.target.checked;
+    state.trainerBoard.set({ drawable: { autoShapes: trainerShapes(position) } });
+  };
+}
+
+async function tryTrainerMove(orig, dest) {
+  const move = state.trainerChess.move({ from: orig, to: dest, promotion: 'q' });
+  if (!move) return;
+  const color = state.trainerChess.turn();
+  const version = ++state.trainerVersion;
+  state.trainerBoard.set({ fen: state.trainerChess.fen(), turnColor: replayColorName(color), movable: { color: replayColorName(color), dests: legalDestsFor(state.trainerChess) }, drawable: { autoShapes: [] } });
+  const info = await engine.analyse(state.trainerChess.fen());
+  if (version !== state.trainerVersion) return;
+  const score = scoreFor(info, 'w', state.trainerChess.fen());
+  updateEvaluationPanel('trainer', score, `После хода ${move.san}`);
+}
+
+function renderTrainer() {
+  const target = document.querySelector('#trainer');
+  if (!target) return;
+  const limitOptions = TRAINER_LIMIT_OPTIONS.map(value => `<option value="${value}" ${value === state.trainer.limit ? 'selected' : ''}>${value}</option>`).join('');
+  target.innerHTML = `<div class="card">
+    <div class="eyebrow">Blunder Training</div>
+    <h2>Тренажёр зевков</h2>
+    <p class="hint">Ищет в уже загруженных партиях (список слева) моменты, где позиция была примерно равной (±1 пешка), а следующим ходом вы допустили зевок. Найдите лучшее продолжение сами.</p>
+    <form id="trainer-form" class="trainer-form">
+      <label>Сколько позиций<select id="trainer-limit">${limitOptions}</select></label>
+      <button type="submit" ${state.trainer.scanning ? 'disabled' : ''}>${state.trainer.scanning ? 'Ищу…' : 'Найти позиции'}</button>
+    </form>
+    <div id="trainer-progress" class="hint"></div>
+  </div>
+  <div id="trainer-card"></div>`;
+  document.querySelector('#trainer-form').onsubmit = event => {
+    event.preventDefault();
+    scanBlunderTrainer(Number(document.querySelector('#trainer-limit').value));
+  };
+  renderTrainerCard();
+}
+
+function setView(view) {
+  state.view = view;
+  document.querySelector('#tab-game').classList.toggle('active', view === 'game');
+  document.querySelector('#tab-trainer').classList.toggle('active', view === 'trainer');
+  document.querySelector('#view-game').classList.toggle('hidden', view !== 'game');
+  document.querySelector('#view-trainer').classList.toggle('hidden', view !== 'trainer');
+}
+
 function renderGames() {
   document.querySelector('#games').innerHTML = state.games.map((game, index) => {
     const color = playerColorFor(game, state.username);
@@ -460,6 +602,7 @@ function renderGames() {
 function selectGame(index) {
   state.selected = index;
   renderGames();
+  setView('game');
   const progress = document.querySelector('#progress');
   progress.textContent = 'Проверяю PGN и запускаю Stockfish…';
   document.querySelector('#report').innerHTML = '<div class="empty">Анализирую партию…</div>';
@@ -488,11 +631,13 @@ async function loadGames(username, limit) {
 
 function render() {
   const limitOptions = [10, 20, 50, 100].map(value => `<option value="${value}" ${value === DEFAULT_GAMES_LIMIT ? 'selected' : ''}>${value}</option>`).join('');
-  app.innerHTML = `<header><h1>Game Analyzer Lite</h1><p>Последние rapid-партии Chess.com с разбором Stockfish прямо в браузере.</p></header><main><aside><form id="username-form"><label>Chess.com username<input id="username" value="${DEFAULT_USERNAME}" required></label><label>Количество партий<select id="games-limit">${limitOptions}</select></label><button>Загрузить партии</button></form><div id="progress"></div><div id="games"></div></aside><section><div id="report"><div class="empty">Выберите партию слева.</div></div></section></main>`;
+  app.innerHTML = `<header><h1>Game Analyzer Lite</h1><p>Последние rapid-партии Chess.com с разбором Stockfish прямо в браузере.</p></header><main><aside><form id="username-form"><label>Chess.com username<input id="username" value="${DEFAULT_USERNAME}" required></label><label>Количество партий<select id="games-limit">${limitOptions}</select></label><button>Загрузить партии</button></form><div id="progress"></div><div id="games"></div></aside><section><div class="tabs"><button id="tab-game" class="tab-btn active">Разбор партии</button><button id="tab-trainer" class="tab-btn">Тренажёр зевков</button></div><div id="view-game"><div id="report"><div class="empty">Выберите партию слева.</div></div></div><div id="view-trainer" class="hidden"><div id="trainer"></div></div></section></main>`;
   document.querySelector('#username-form').onsubmit = event => {
     event.preventDefault();
     loadGames(document.querySelector('#username').value.trim(), Number(document.querySelector('#games-limit').value));
   };
+  document.querySelector('#tab-game').onclick = () => setView('game');
+  document.querySelector('#tab-trainer').onclick = () => { setView('trainer'); renderTrainer(); };
   loadGames(DEFAULT_USERNAME, DEFAULT_GAMES_LIMIT);
 }
 
