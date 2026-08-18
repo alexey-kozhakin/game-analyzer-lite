@@ -20,6 +20,16 @@ const MISS_WIN_THRESHOLD = 85;
 const MISS_LOSS_THRESHOLD = 150;
 const TRAINER_EQUAL_THRESHOLD = 100;
 const TRAINER_LIMIT_OPTIONS = [10, 20, 50];
+const TRAINER_BRUSHES = {
+  best: { key: 'tb', color: '#22d3ee', opacity: 1, lineWidth: 10 },
+  played: { key: 'tp', color: '#ec4899', opacity: 1, lineWidth: 10 },
+  oppChecks: { key: 'oc', color: '#e53935', opacity: 1, lineWidth: 10 },
+  oppCaptures: { key: 'ox', color: '#fb8c00', opacity: 1, lineWidth: 10 },
+  oppAttacks: { key: 'oa', color: '#fdd835', opacity: 1, lineWidth: 10 },
+  myChecks: { key: 'mc', color: '#42a5f5', opacity: 1, lineWidth: 10 },
+  myCaptures: { key: 'mx', color: '#66bb6a', opacity: 1, lineWidth: 10 },
+  myAttacks: { key: 'ma', color: '#ab47bc', opacity: 1, lineWidth: 10 },
+};
 const PIECE_VALUES = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 0 };
 const REVIEW_CATEGORIES = ['Brilliant', 'Great', 'Best', 'Excellent', 'Good', 'Inaccuracy', 'Mistake', 'Miss', 'Blunder'];
 
@@ -48,6 +58,7 @@ const state = {
   trainerVersion: 0,
   trainerShowBest: false,
   trainerShowPlayed: false,
+  trainerThreats: { oppChecks: false, oppCaptures: false, oppAttacks: false, myChecks: false, myCaptures: false, myAttacks: false },
 };
 
 async function fetchArchives(username) {
@@ -198,6 +209,43 @@ function updateEvaluationPanel(idPrefix, score, label = 'Оценка позиц
     bar.querySelector('.eval-bar-white').style.height = `${Math.max(3, Math.min(97, 50 + score / 20))}%`;
     bar.querySelector('.eval-bar-white b').textContent = formatScore(score);
   }
+}
+
+function movesForColor(fen, color) {
+  const parts = fen.split(' ');
+  const targetFen = parts[1] === color ? fen : (() => { parts[1] = color; parts[3] = '-'; return parts.join(' '); })();
+  try {
+    return new Chess(targetFen).moves({ verbose: true });
+  } catch {
+    return [];
+  }
+}
+
+function moveAttacksEnemyPiece(fen, move) {
+  const parts = fen.split(' ');
+  const startFen = parts[1] === move.color ? fen : (() => { parts[1] = move.color; parts[3] = '-'; return parts.join(' '); })();
+  const chess = new Chess(startFen);
+  try {
+    chess.move(move);
+  } catch {
+    return false;
+  }
+  const afterParts = chess.fen().split(' ');
+  afterParts[1] = move.color;
+  afterParts[3] = '-';
+  try {
+    return new Chess(afterParts.join(' ')).moves({ square: move.to, verbose: true }).some(candidate => candidate.captured);
+  } catch {
+    return false;
+  }
+}
+
+function categorizeThreats(fen, color) {
+  const moves = movesForColor(fen, color);
+  const checks = moves.filter(move => move.san.includes('+') || move.san.includes('#'));
+  const captures = moves.filter(move => move.captured);
+  const attacks = moves.filter(move => !move.captured && moveAttacksEnemyPiece(fen, move));
+  return { checks, captures, attacks };
 }
 
 function legalDestsFor(chess) {
@@ -469,15 +517,62 @@ function renderReport() {
   renderErrorTable();
 }
 
-function trainerShapes(position) {
+function currentTrainerColors() {
+  const mover = state.trainerChess.turn();
+  return { mover, opponent: mover === 'w' ? 'b' : 'w' };
+}
+
+function buildTrainerAutoShapes(position) {
   const shapes = [];
   if (state.trainerShowBest && position.bestUci) {
-    shapes.push({ orig: position.bestUci.slice(0, 2), dest: position.bestUci.slice(2, 4), brush: 'green' });
+    shapes.push({ orig: position.bestUci.slice(0, 2), dest: position.bestUci.slice(2, 4), brush: 'best' });
   }
   if (state.trainerShowPlayed && position.playedUci) {
-    shapes.push({ orig: position.playedUci.slice(0, 2), dest: position.playedUci.slice(2, 4), brush: 'red' });
+    shapes.push({ orig: position.playedUci.slice(0, 2), dest: position.playedUci.slice(2, 4), brush: 'played' });
   }
+  const fen = state.trainerChess.fen();
+  const { mover, opponent } = currentTrainerColors();
+  [
+    { prefix: 'opp', color: opponent },
+    { prefix: 'my', color: mover },
+  ].forEach(({ prefix, color }) => {
+    const activeKinds = ['Checks', 'Captures', 'Attacks'].filter(kind => state.trainerThreats[`${prefix}${kind}`]);
+    if (!activeKinds.length) return;
+    const threats = categorizeThreats(fen, color);
+    activeKinds.forEach(kind => {
+      const brush = `${prefix}${kind}`;
+      threats[kind.toLowerCase()].forEach(move => shapes.push({ orig: move.from, dest: move.to, brush }));
+    });
+  });
   return shapes;
+}
+
+function renderThreatsPanel() {
+  const panel = document.querySelector('#trainer-threats');
+  if (!panel) return;
+  const fen = state.trainerChess.fen();
+  const { mover, opponent } = currentTrainerColors();
+  const groups = [
+    { prefix: 'opp', label: `Угрозы соперника (${opponent === 'w' ? 'белые' : 'чёрные'})`, threats: categorizeThreats(fen, opponent) },
+    { prefix: 'my', label: `Мои угрозы (${mover === 'w' ? 'белые' : 'чёрные'})`, threats: categorizeThreats(fen, mover) },
+  ];
+  const kinds = [['Checks', 'Шахи', 'checks'], ['Captures', 'Взятия', 'captures'], ['Attacks', 'Нападения', 'attacks']];
+  panel.innerHTML = groups.map(group => `<div class="threats-group">
+    <div class="eyebrow">${group.label}</div>
+    <div class="threats-buttons">${kinds.map(([kind, label, field]) => {
+      const key = `${group.prefix}${kind}`;
+      const active = state.trainerThreats[key];
+      const color = TRAINER_BRUSHES[key].color;
+      const style = active ? `border-color:${color};background:${color}26;` : '';
+      return `<button data-threat-key="${key}" class="threat-btn" style="${style}">${label} ${active ? `<b>${group.threats[field].length}</b>` : ''}</button>`;
+    }).join('')}</div>
+  </div>`).join('');
+  panel.querySelectorAll('[data-threat-key]').forEach(button => button.onclick = () => {
+    const key = button.dataset.threatKey;
+    state.trainerThreats[key] = !state.trainerThreats[key];
+    renderThreatsPanel();
+    state.trainerBoard.set({ drawable: { autoShapes: buildTrainerAutoShapes(currentTrainerPosition()) } });
+  });
 }
 
 async function scanBlunderTrainer(limit) {
@@ -488,6 +583,7 @@ async function scanBlunderTrainer(limit) {
   state.trainer.index = 0;
   state.trainerShowBest = false;
   state.trainerShowPlayed = false;
+  state.trainerThreats = { oppChecks: false, oppCaptures: false, oppAttacks: false, myChecks: false, myCaptures: false, myAttacks: false };
   renderTrainer();
   const found = [];
   for (let gameIndex = 0; gameIndex < state.games.length && found.length < limit; gameIndex++) {
@@ -528,32 +624,35 @@ function renderTrainerCard() {
   const mover = state.trainerChess.turn();
   const orientation = position.color === 'w' ? 'white' : 'black';
   const whiteScore = position.color === 'w' ? position.before : -position.before;
-  target.innerHTML = `<div class="replay-card"><div class="chart-heading"><div><div class="eyebrow">Зевок ${state.trainer.index + 1} из ${state.trainer.positions.length}</div><h2>${position.moveNumber}${position.color === 'w' ? '.' : '…'} — найдите лучшее продолжение за ${position.color === 'w' ? 'белых' : 'чёрных'}</h2></div><span class="score-label">${position.game.white.username} — ${position.game.black.username}</span></div><div class="replay-grid"><div><div id="trainer-eval" class="eval-status"><span>Оценка позиции</span><b>${formatScore(whiteScore)}</b><span>${advantageText(whiteScore)}</span></div><div class="replay-analysis-board">${evaluationBarHtml(whiteScore, 'trainer')}<div id="trainer-board" class="replay-board"></div></div><div class="replay-controls"><button id="trainer-prev" class="secondary" ${state.trainer.index === 0 ? 'disabled' : ''}>← Предыдущий</button><span>${state.trainer.index + 1} / ${state.trainer.positions.length}</span><button id="trainer-next" class="secondary" ${state.trainer.index === state.trainer.positions.length - 1 ? 'disabled' : ''}>Следующий →</button><button id="trainer-reset" class="secondary">↶ Сброс</button></div><label class="hint-toggle"><input id="trainer-show-best" type="checkbox" ${state.trainerShowBest ? 'checked' : ''}> Показать лучший ход</label><label class="hint-toggle"><input id="trainer-show-played" type="checkbox" ${state.trainerShowPlayed ? 'checked' : ''}> Показать сыгранный ход (${position.played}, потеря ${formatScore(position.loss)})</label></div></div></div>`;
+  target.innerHTML = `<div class="replay-card"><div class="chart-heading"><div><div class="eyebrow">Зевок ${state.trainer.index + 1} из ${state.trainer.positions.length}</div><h2>${position.moveNumber}${position.color === 'w' ? '.' : '…'} — найдите лучшее продолжение за ${position.color === 'w' ? 'белых' : 'чёрных'}</h2></div><span class="score-label">${position.game.white.username} — ${position.game.black.username}</span></div><div class="replay-grid"><div><div id="trainer-eval" class="eval-status"><span>Оценка позиции</span><b>${formatScore(whiteScore)}</b><span>${advantageText(whiteScore)}</span></div><div class="replay-analysis-board">${evaluationBarHtml(whiteScore, 'trainer')}<div id="trainer-board" class="replay-board"></div></div><div class="replay-controls"><button id="trainer-prev" class="secondary" ${state.trainer.index === 0 ? 'disabled' : ''}>← Предыдущий</button><span>${state.trainer.index + 1} / ${state.trainer.positions.length}</span><button id="trainer-next" class="secondary" ${state.trainer.index === state.trainer.positions.length - 1 ? 'disabled' : ''}>Следующий →</button><button id="trainer-reset" class="secondary">↶ Сброс</button></div><div class="trainer-toggles"><label class="hint-toggle"><input id="trainer-show-best" type="checkbox" ${state.trainerShowBest ? 'checked' : ''}> Показать лучший ход</label><label class="hint-toggle"><input id="trainer-show-played" type="checkbox" ${state.trainerShowPlayed ? 'checked' : ''}> Показать сыгранный ход (${position.played}, потеря ${formatScore(position.loss)})</label></div></div><div id="trainer-threats" class="threats-panel"></div></div></div>`;
   state.trainerBoard = Chessground(document.querySelector('#trainer-board'), {
     fen: position.fen, orientation, turnColor: mover === 'w' ? 'white' : 'black', coordinates: true,
     events: { move: tryTrainerMove },
     movable: { free: false, color: mover === 'w' ? 'white' : 'black', dests: legalDestsFor(state.trainerChess) },
-    drawable: { autoShapes: trainerShapes(position) },
+    drawable: { autoShapes: buildTrainerAutoShapes(position), brushes: TRAINER_BRUSHES },
   });
   document.querySelector('#trainer-prev').onclick = () => { if (state.trainer.index > 0) { state.trainer.index--; renderTrainerCard(); } };
   document.querySelector('#trainer-next').onclick = () => { if (state.trainer.index < state.trainer.positions.length - 1) { state.trainer.index++; renderTrainerCard(); } };
   document.querySelector('#trainer-reset').onclick = () => renderTrainerCard();
   document.querySelector('#trainer-show-best').onchange = event => {
     state.trainerShowBest = event.target.checked;
-    state.trainerBoard.set({ drawable: { autoShapes: trainerShapes(position) } });
+    state.trainerBoard.set({ drawable: { autoShapes: buildTrainerAutoShapes(position) } });
   };
   document.querySelector('#trainer-show-played').onchange = event => {
     state.trainerShowPlayed = event.target.checked;
-    state.trainerBoard.set({ drawable: { autoShapes: trainerShapes(position) } });
+    state.trainerBoard.set({ drawable: { autoShapes: buildTrainerAutoShapes(position) } });
   };
+  renderThreatsPanel();
 }
 
 async function tryTrainerMove(orig, dest) {
   const move = state.trainerChess.move({ from: orig, to: dest, promotion: 'q' });
   if (!move) return;
+  const position = currentTrainerPosition();
   const color = state.trainerChess.turn();
   const version = ++state.trainerVersion;
-  state.trainerBoard.set({ fen: state.trainerChess.fen(), turnColor: replayColorName(color), movable: { color: replayColorName(color), dests: legalDestsFor(state.trainerChess) }, drawable: { autoShapes: [] } });
+  state.trainerBoard.set({ fen: state.trainerChess.fen(), turnColor: replayColorName(color), movable: { color: replayColorName(color), dests: legalDestsFor(state.trainerChess) }, drawable: { autoShapes: buildTrainerAutoShapes(position) } });
+  renderThreatsPanel();
   const info = await engine.analyse(state.trainerChess.fen());
   if (version !== state.trainerVersion) return;
   const score = scoreFor(info, 'w', state.trainerChess.fen());
