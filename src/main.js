@@ -666,7 +666,7 @@ function renderTrainer() {
   target.innerHTML = `<div class="card">
     <div class="eyebrow">Blunder Training</div>
     <h2>Тренажёр зевков</h2>
-    <p class="hint">Ищет в уже загруженных партиях (список слева) моменты, где позиция была примерно равной (±1 пешка), а следующим ходом вы допустили зевок. Найдите лучшее продолжение сами.</p>
+    <p class="hint">Ищет в партиях, загруженных во вкладке «Партии», моменты, где позиция была примерно равной (±1 пешка), а следующим ходом вы допустили зевок. Найдите лучшее продолжение сами.</p>
     <form id="trainer-form" class="trainer-form">
       <label>Сколько позиций<select id="trainer-limit">${limitOptions}</select></label>
       <button type="submit" ${state.trainer.scanning ? 'disabled' : ''}>${state.trainer.scanning ? 'Ищу…' : 'Найти позиции'}</button>
@@ -681,19 +681,35 @@ function renderTrainer() {
   renderTrainerCard();
 }
 
-function setView(view) {
-  state.view = view;
-  document.querySelector('#tab-game').classList.toggle('active', view === 'game');
-  document.querySelector('#tab-trainer').classList.toggle('active', view === 'trainer');
-  document.querySelector('#view-game').classList.toggle('hidden', view !== 'game');
-  document.querySelector('#view-trainer').classList.toggle('hidden', view !== 'trainer');
+const TAB_ICONS = {
+  games: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1.2"/><rect x="3" y="10" width="18" height="4" rx="1.2"/><rect x="3" y="16" width="18" height="4" rx="1.2"/></svg>',
+  review: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19V9M11 19V5M18 19v-7"/><path d="M2 19h20"/></svg>',
+  trainer: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="4"/><circle cx="12" cy="12" r=".6" fill="currentColor"/></svg>',
+};
+const TAB_TITLES = { games: 'Партии', review: 'Разбор партии', trainer: 'Тренажёр зевков' };
+
+function switchTab(tab) {
+  state.view = tab;
+  document.querySelectorAll('.tab-item').forEach(button => button.classList.toggle('active', button.dataset.tab === tab));
+  document.querySelectorAll('.panel').forEach(panel => panel.classList.toggle('active', panel.id === `panel-${tab}`));
+  document.querySelector('#screen-title').textContent = TAB_TITLES[tab];
+  window.scrollTo({ top: 0 });
+  if (tab === 'trainer') renderTrainer();
 }
 
 function renderGames() {
   document.querySelector('#games').innerHTML = state.games.map((game, index) => {
     const color = playerColorFor(game, state.username);
     const outcome = color ? gameOutcomeFor(game, color) : '—';
-    return `<button class="game ${index === state.selected ? 'active' : ''}" data-game="${index}"><b>${game.white.username} — ${game.black.username}</b><span>${new Date(game.end_time * 1000).toLocaleString()} · ${outcome}</span></button>`;
+    const resultClass = outcome === 'Победа' ? 'result-win' : outcome === 'Поражение' ? 'result-loss' : 'result-draw';
+    return `<button class="game ${index === state.selected ? 'active' : ''}" data-game="${index}">
+      <span class="who">
+        <b>${game.white.username} — ${game.black.username}</b>
+        <span>${new Date(game.end_time * 1000).toLocaleString()}</span>
+      </span>
+      <span class="result-pill ${resultClass}">${outcome}</span>
+      <span class="chev">›</span>
+    </button>`;
   }).join('') || '<p class="hint">Партии не найдены.</p>';
   document.querySelectorAll('[data-game]').forEach(button => button.onclick = () => selectGame(Number(button.dataset.game)));
 }
@@ -701,7 +717,7 @@ function renderGames() {
 function selectGame(index) {
   state.selected = index;
   renderGames();
-  setView('game');
+  switchTab('review');
   const progress = document.querySelector('#progress');
   progress.textContent = 'Проверяю PGN и запускаю Stockfish…';
   document.querySelector('#report').innerHTML = '<div class="empty">Анализирую партию…</div>';
@@ -715,7 +731,7 @@ async function loadGames(username, limit) {
   state.gamesLimit = limit;
   state.selected = -1;
   state.analysis = null;
-  document.querySelector('#report').innerHTML = '<div class="empty">Выберите партию слева.</div>';
+  document.querySelector('#report').innerHTML = '<div class="empty">Выберите партию во вкладке «Партии».</div>';
   try {
     state.games = await fetchLastGames(username, limit);
     progress.textContent = `Загружено rapid-партий: ${state.games.length}.`;
@@ -730,13 +746,39 @@ async function loadGames(username, limit) {
 
 function render() {
   const limitOptions = [10, 20, 50, 100].map(value => `<option value="${value}" ${value === DEFAULT_GAMES_LIMIT ? 'selected' : ''}>${value}</option>`).join('');
-  app.innerHTML = `<header><h1>Game Analyzer Lite</h1><p>Последние rapid-партии Chess.com с разбором Stockfish прямо в браузере.</p></header><main><aside><form id="username-form"><label>Chess.com username<input id="username" value="${DEFAULT_USERNAME}" required></label><label>Количество партий<select id="games-limit">${limitOptions}</select></label><button>Загрузить партии</button></form><div id="progress"></div><div id="games"></div></aside><section><div class="tabs"><button id="tab-game" class="tab-btn active">Разбор партии</button><button id="tab-trainer" class="tab-btn">Тренажёр зевков</button></div><div id="view-game"><div id="report"><div class="empty">Выберите партию слева.</div></div></div><div id="view-trainer" class="hidden"><div id="trainer"></div></div></section></main>`;
+  const tabs = ['games', 'review', 'trainer'].map(tab => `<button class="tab-item ${tab === 'games' ? 'active' : ''}" data-tab="${tab}">${TAB_ICONS[tab]}${TAB_TITLES[tab]}</button>`).join('');
+  app.innerHTML = `<div class="shell">
+    <header class="topbar">
+      <h1>Game Analyzer Lite</h1>
+      <p class="tagline">Rapid-партии Chess.com с разбором Stockfish прямо в браузере</p>
+      <div class="screen-title" id="screen-title">Партии</div>
+    </header>
+    <main class="content">
+      <section class="panel active" id="panel-games">
+        <div class="card">
+          <form id="username-form">
+            <label>Chess.com username<input id="username" value="${DEFAULT_USERNAME}" required></label>
+            <label>Количество партий<select id="games-limit">${limitOptions}</select></label>
+            <button>Загрузить партии</button>
+          </form>
+          <div id="progress"></div>
+        </div>
+        <div id="games"></div>
+      </section>
+      <section class="panel" id="panel-review">
+        <div id="report"><div class="empty">Выберите партию во вкладке «Партии».</div></div>
+      </section>
+      <section class="panel" id="panel-trainer">
+        <div id="trainer"></div>
+      </section>
+    </main>
+    <nav class="tabbar">${tabs}</nav>
+  </div>`;
   document.querySelector('#username-form').onsubmit = event => {
     event.preventDefault();
     loadGames(document.querySelector('#username').value.trim(), Number(document.querySelector('#games-limit').value));
   };
-  document.querySelector('#tab-game').onclick = () => setView('game');
-  document.querySelector('#tab-trainer').onclick = () => { setView('trainer'); renderTrainer(); };
+  document.querySelectorAll('.tab-item').forEach(button => button.onclick = () => switchTab(button.dataset.tab));
   loadGames(DEFAULT_USERNAME, DEFAULT_GAMES_LIMIT);
 }
 
